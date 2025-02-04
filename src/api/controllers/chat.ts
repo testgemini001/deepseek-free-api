@@ -546,11 +546,11 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
   const isSearchModel = model.includes('search');
   const isThinkingModel = model.includes('think') || model.includes('r1');
   const isSilentModel = model.includes('silent');
-  const isFoldModel = model.includes('fold');
-  logger.info(`模型: ${model}, 是否思考: ${isThinkingModel} 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}, 是否折叠思考: ${isFoldModel}`);
+  logger.info(`模型: ${model}, 是否思考: ${isThinkingModel} 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}`);
   let refContent = '';
+  let reasoningContent = '';
+  
   return new Promise((resolve, reject) => {
-    // 消息初始化
     const data = {
       id: "",
       model,
@@ -558,17 +558,34 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
       choices: [
         {
           index: 0,
-          message: { role: "assistant", content: "" },
+          message: { 
+            role: "assistant", 
+            content: "",
+            reasoning_content: null 
+          },
           finish_reason: "stop",
         },
       ],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      usage: { 
+        prompt_tokens: 1, 
+        completion_tokens: 1, 
+        total_tokens: 2,
+        prompt_tokens_details: {
+          cached_tokens: 0
+        },
+        completion_tokens_details: {
+          reasoning_tokens: 0
+        },
+        prompt_cache_hit_tokens: 0,
+        prompt_cache_miss_tokens: 1
+      },
       created: util.unixTimestamp(),
+      system_fingerprint: `fp_${util.generateRandomString({charset: 'hex', length: 8})}`
     };
+
     const parser = createParser((event) => {
       try {
         if (event.type !== "event" || event.data.trim() == "[DONE]") return;
-        // 解析JSON
         const result = _.attempt(() => JSON.parse(event.data));
         if (_.isError(result))
           throw new Error(`Stream response invalid: ${event.data}`);
@@ -576,27 +593,35 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
           return;
         if (!data.id)
           data.id = `${refConvId}@${result.message_id}`;
+
         if (result.choices[0].delta.type === "search_result" && !isSilentModel) {
           const searchResults = result.choices[0]?.delta?.search_results || [];
           refContent += searchResults.map(item => `${item.title} - ${item.url}`).join('\n');
           return;
         }
+
         if (result.choices[0].delta.type === "thinking") {
           if (!thinking && isThinkingModel && !isSilentModel) {
             thinking = true;
-            data.choices[0].message.content += isFoldModel ? "<details><summary>思考过程</summary><pre>" : "[思考开始]\n";
           }
-          if (isSilentModel)
-            return;
+          if (!isSilentModel && result.choices[0].delta.content) {
+            reasoningContent += result.choices[0].delta.content;
+          }
+          return;
         }
         else if (thinking && isThinkingModel && !isSilentModel) {
           thinking = false;
-          data.choices[0].message.content += isFoldModel ? "</pre></details>" : "\n\n[思考结束]\n";
         }
+
         if (result.choices[0].delta.content)
           data.choices[0].message.content += result.choices[0].delta.content;
+
         if (result.choices && result.choices[0] && result.choices[0].finish_reason === "stop") {
           data.choices[0].message.content = data.choices[0].message.content.replace(/^\n+/, '').replace(/\[citation:\d+\]/g, '') + (refContent ? `\n\n搜索结果来自：\n${refContent}` : '');
+          if (reasoningContent) {
+            data.choices[0].message.reasoning_content = reasoningContent;
+            data.usage.completion_tokens_details.reasoning_tokens = Math.floor(reasoningContent.length / 4);
+          }
           resolve(data);
         }
       } catch (err) {
@@ -604,32 +629,24 @@ async function receiveStream(model: string, stream: any, refConvId?: string): Pr
         reject(err);
       }
     });
-    // 将流数据喂给SSE转换器
+
     stream.on("data", (buffer) => parser.feed(buffer.toString()));
     stream.once("error", (err) => reject(err));
     stream.once("close", () => resolve(data));
   });
 }
 
-/**
- * 创建转换流
- *
- * 将流格式转换为gpt兼容流格式
- *
- * @param model 模型名称
- * @param stream 消息流
- * @param endCallback 传输结束回调
- */
 function createTransStream(model: string, stream: any, refConvId: string, endCallback?: Function) {
   let thinking = false;
-  const isSearchModel = model.includes('search');
-  const isThinkingModel = model.includes('think') || model.includes('r1');
-  const isSilentModel = model.includes('silent');
-  const isFoldModel = model.includes('fold');
-  logger.info(`模型: ${model}, 是否思考: ${isThinkingModel}, 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}, 是否折叠思考: ${isFoldModel}`);
-  // 消息创建时间
+  let isSearchModel = model.includes('search');
+  let isThinkingModel = model.includes('think') || model.includes('r1');
+  let isSilentModel = model.includes('silent');
+  
+  logger.info(`模型: ${model}, 是否思考: ${isThinkingModel}, 是否联网搜索: ${isSearchModel}, 是否静默思考: ${isSilentModel}`);
+  
   const created = util.unixTimestamp();
-  // 创建转换流
+  const systemFingerprint = `fp_${util.generateRandomString({charset: 'hex', length: 8})}`;
+  
   const transStream = new PassThrough();
   !transStream.closed &&
     transStream.write(
@@ -640,23 +657,28 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
         choices: [
           {
             index: 0,
-            delta: { role: "assistant", content: "" },
+            delta: { 
+              role: "assistant", 
+              content: null,
+              reasoning_content: null
+            },
             finish_reason: null,
           },
         ],
         created,
+        system_fingerprint: systemFingerprint
       })}\n\n`
     );
+
   const parser = createParser((event) => {
     try {
       if (event.type !== "event" || event.data.trim() == "[DONE]") return;
-      // 解析JSON
       const result = _.attempt(() => JSON.parse(event.data));
       if (_.isError(result))
         throw new Error(`Stream response invalid: ${event.data}`);
       if (!result.choices || !result.choices[0] || !result.choices[0].delta)
         return;
-      result.model = model;
+
       if (result.choices[0].delta.type === "search_result" && !isSilentModel) {
         const searchResults = result.choices[0]?.delta?.search_results || [];
         if (searchResults.length > 0) {
@@ -668,17 +690,21 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
             choices: [
               {
                 index: 0,
-                delta: { role: "assistant", content: refContent },
+                delta: { 
+                  content: refContent,
+                  reasoning_content: null
+                },
                 finish_reason: null,
               },
             ],
+            system_fingerprint: systemFingerprint
           })}\n\n`);
         }
         return;
       }
+
       if (result.choices[0].delta.type === "thinking") {
-        if (!thinking && isThinkingModel && !isSilentModel) {
-          thinking = true;
+        if (result.choices[0].delta.content && !isSilentModel) {
           transStream.write(`data: ${JSON.stringify({
             id: `${refConvId}@${result.message_id}`,
             model: result.model,
@@ -686,18 +712,20 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
             choices: [
               {
                 index: 0,
-                delta: { role: "assistant", content: isFoldModel ? "<details><summary>思考过程</summary><pre>" : "[思考开始]\n" },
+                delta: { 
+                  content: null,
+                  reasoning_content: result.choices[0].delta.content
+                },
                 finish_reason: null,
               },
             ],
-            created,
+            system_fingerprint: systemFingerprint
           })}\n\n`);
         }
-        if (isSilentModel)
-          return;
+        return;
       }
-      else if (thinking && isThinkingModel && !isSilentModel) {
-        thinking = false;
+
+      if (result.choices[0].delta.content) {
         transStream.write(`data: ${JSON.stringify({
           id: `${refConvId}@${result.message_id}`,
           model: result.model,
@@ -705,31 +733,18 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
           choices: [
             {
               index: 0,
-              delta: { role: "assistant", content: isFoldModel ? "</pre></details>" : "\n\n[思考结束]\n" },
+              delta: { 
+                content: result.choices[0].delta.content.replace(/\[citation:\d+\]/g, ''),
+                reasoning_content: null
+              },
               finish_reason: null,
             },
           ],
-          created,
+          system_fingerprint: systemFingerprint
         })}\n\n`);
       }
 
-      if (!result.choices[0].delta.content)
-        return;
-
-      transStream.write(`data: ${JSON.stringify({
-        id: `${refConvId}@${result.message_id}`,
-        model: result.model,
-        object: "chat.completion.chunk",
-        choices: [
-          {
-            index: 0,
-            delta: { role: "assistant", content: result.choices[0].delta.content.replace(/\[citation:\d+\]/g, '') },
-            finish_reason: null,
-          },
-        ],
-        created,
-      })}\n\n`);
-      if (result.choices && result.choices[0] && result.choices[0].finish_reason === "stop") {
+      if (result.choices[0].finish_reason === "stop") {
         transStream.write(`data: ${JSON.stringify({
           id: `${refConvId}@${result.message_id}`,
           model: result.model,
@@ -737,11 +752,11 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
           choices: [
             {
               index: 0,
-              delta: { role: "assistant", content: "" },
+              delta: {},
               finish_reason: "stop"
             },
           ],
-          created,
+          system_fingerprint: systemFingerprint
         })}\n\n`);
         !transStream.closed && transStream.end("data: [DONE]\n\n");
         endCallback && endCallback();
@@ -751,19 +766,14 @@ function createTransStream(model: string, stream: any, refConvId: string, endCal
       !transStream.closed && transStream.end("data: [DONE]\n\n");
     }
   });
-  // 将流数据喂给SSE转换器
+
   stream.on("data", (buffer) => parser.feed(buffer.toString()));
-  stream.once(
-    "error",
-    () => !transStream.closed && transStream.end("data: [DONE]\n\n")
-  );
-  stream.once(
-    "close",
-    () => {
-      !transStream.closed && transStream.end("data: [DONE]\n\n");
-      endCallback && endCallback();
-    }
-  );
+  stream.once("error", () => !transStream.closed && transStream.end("data: [DONE]\n\n"));
+  stream.once("close", () => {
+    !transStream.closed && transStream.end("data: [DONE]\n\n");
+    endCallback && endCallback();
+  });
+
   return transStream;
 }
 
